@@ -63,7 +63,7 @@ impl SignatureDb {
     /// Default on-disk location for the cached signature database.
     pub fn default_path() -> Result<PathBuf> {
         let dir = dirs::cache_dir()
-            .map(|d| d.join("detection-cli"))
+            .map(|d| d.join("qilin"))
             .unwrap_or_else(|| PathBuf::from("."));
         Ok(dir.join(CACHE_FILE_NAME))
     }
@@ -107,7 +107,7 @@ impl SignatureDb {
         );
 
         let response = reqwest::blocking::Client::builder()
-            .user_agent("detection-cli/0.1")
+            .user_agent("qilin/0.1")
             .build()?
             .get(&url)
             .send()
@@ -281,7 +281,7 @@ mod tests {
 \"2026-07-02 00:00:00\",\"not-a-valid-hash\",\"beadfeed\",\"Ransom.Fake\"\n\
 \"2026-07-03 00:00:00\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"cafebabe\",\"\"\n\
 ";
-        let dir = std::env::temp_dir().join(format!("detection-cli-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("qilin-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("cache.tsv");
 
@@ -311,7 +311,7 @@ mod tests {
         let body = "\
 \"2026-07-01 00:00:00\",\"56aad4955d4a52b5bbe3080f2bc67a507c181ff023169587e0ad3ab4e1789408\",\"md5\",\"sha1\",\"abuse_ch\",\"a.js\",\"js\",\"text/plain\",\"AsyncRAT\",\"n/a\",\"n/a\",\"n/a\",\"ssdeep\",\"tlsh\"\n\
 ";
-        let dir = std::env::temp_dir().join(format!("detection-cli-test-fallback-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("qilin-test-fallback-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("cache.tsv");
 
@@ -335,7 +335,7 @@ mod tests {
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
 not-a-hash\n\
 ";
-        let dir = std::env::temp_dir().join(format!("detection-cli-test-txt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("qilin-test-txt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dest = dir.join("cache.tsv");
 

@@ -7,7 +7,7 @@ use db::{Dataset, ExportFormat, SignatureDb};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "detection-cli", version, about = "A minimal file-hash malware scanner")]
+#[command(name = "qilin", version, about = "A minimal file-hash malware scanner")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -100,7 +100,7 @@ fn cmd_scan(path: Option<PathBuf>, db: Option<PathBuf>, verbose: bool, exclude: 
     let db_path = resolve_db_path(db)?;
     if !db_path.exists() {
         bail!(
-            "no signature database found at {}\nrun `detection-cli update --auth-key <KEY>` first",
+            "no signature database found at {}\nrun `qilin update --auth-key <KEY>` first",
             db_path.display()
         );
     }

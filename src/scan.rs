@@ -147,7 +147,7 @@ mod tests {
     use std::fs;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("detection-cli-scan-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("qilin-scan-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("subdir")).unwrap();
         dir
