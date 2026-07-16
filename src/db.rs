@@ -43,6 +43,15 @@ pub struct SignatureDb {
 }
 
 impl SignatureDb {
+    /// An empty database with no known hashes (useful for tests, or a scan
+    /// run before any signatures have been fetched).
+    #[allow(dead_code)]
+    pub fn empty() -> Self {
+        Self {
+            hashes: HashMap::new(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.hashes.len()
     }

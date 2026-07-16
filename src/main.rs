@@ -15,15 +15,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scan a file or directory against the local signature database
+    /// Scan a file or directory against the local signature database.
+    /// Omit PATH to scan the entire filesystem.
     Scan {
-        path: PathBuf,
+        path: Option<PathBuf>,
         /// Signature database path (defaults to the OS cache dir)
         #[arg(long)]
         db: Option<PathBuf>,
         /// Print every file as it's scanned, not just detections
         #[arg(short, long)]
         verbose: bool,
+        /// Skip a path entirely (repeatable). Always applied on top of the
+        /// default /proc, /sys, /dev, /run exclusions on Unix.
+        #[arg(long)]
+        exclude: Vec<PathBuf>,
     },
     /// Download and cache the MalwareBazaar hash export
     Update {
@@ -50,9 +55,19 @@ enum FormatArg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan { path, db, verbose } => cmd_scan(path, db, verbose),
+        Command::Scan { path, db, verbose, exclude } => cmd_scan(path, db, verbose, exclude),
         Command::Update { auth_key, db, full, format } => cmd_update(auth_key, db, full, format),
     }
+}
+
+/// Where to scan when the user doesn't name a path: everywhere.
+#[cfg(unix)]
+fn whole_system_path() -> PathBuf {
+    PathBuf::from("/")
+}
+#[cfg(not(unix))]
+fn whole_system_path() -> PathBuf {
+    PathBuf::from(std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string()) + "\\")
 }
 
 fn resolve_db_path(db: Option<PathBuf>) -> Result<PathBuf> {
@@ -81,7 +96,7 @@ fn cmd_update(auth_key: String, db: Option<PathBuf>, full: bool, format: FormatA
     Ok(())
 }
 
-fn cmd_scan(path: PathBuf, db: Option<PathBuf>, verbose: bool) -> Result<()> {
+fn cmd_scan(path: Option<PathBuf>, db: Option<PathBuf>, verbose: bool, exclude: Vec<PathBuf>) -> Result<()> {
     let db_path = resolve_db_path(db)?;
     if !db_path.exists() {
         bail!(
@@ -90,13 +105,33 @@ fn cmd_scan(path: PathBuf, db: Option<PathBuf>, verbose: bool) -> Result<()> {
         );
     }
     let signatures = SignatureDb::load(&db_path)?;
+
+    let path = match path {
+        Some(p) => p,
+        None => {
+            let whole = whole_system_path();
+            println!(
+                "No path given — scanning the entire filesystem from {} (this may take a while)",
+                whole.display()
+            );
+            whole
+        }
+    };
+
     println!(
         "Scanning {} ({} signatures loaded)",
         path.display(),
         signatures.len()
     );
+    // Rust's stdout is block-buffered when not a TTY (e.g. piped/redirected),
+    // so without an explicit flush this "scan started" line wouldn't show up
+    // until the whole scan finished, making a long scan look hung.
+    {
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+    }
 
-    let report = scan::scan_path(&path, &signatures, |p| {
+    let report = scan::scan_path(&path, &signatures, &exclude, |p| {
         if verbose {
             println!("  scanning {}", p.display());
         }
@@ -119,6 +154,18 @@ fn cmd_scan(path: PathBuf, db: Option<PathBuf>, verbose: bool) -> Result<()> {
         report.matches.len(),
         report.elapsed.as_secs_f64()
     );
+    if report.files_errored > 0 {
+        eprintln!(
+            "note: {} file(s) could not be read (permissions, etc.) — re-run with sudo for full coverage",
+            report.files_errored
+        );
+    }
+
+    // std::process::exit skips flushing Rust's buffered stdout (it's only
+    // line-buffered on a TTY; a redirected/piped stdout is block-buffered),
+    // so results could be silently truncated if we didn't flush explicitly.
+    use std::io::Write;
+    std::io::stdout().flush().ok();
 
     if !report.matches.is_empty() {
         std::process::exit(1);
