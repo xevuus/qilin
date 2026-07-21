@@ -8,8 +8,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
+use yara_x::Rules;
 
 use crate::db::SignatureDb;
+
+// Files larger than this are still hashed and checked against the hash
+// database in full, but YARA pattern matching is limited to their first
+// chunk. Community/custom rules target headers and embedded strings, not
+// multi-gigabyte payloads, so this keeps a whole-filesystem scan from
+// stalling on VM disks, ISOs, etc.
+const YARA_MAX_SCAN_SIZE: usize = 64 * 1024 * 1024;
 
 // How often (in files hashed) to emit a "still working" progress line on
 // stderr during long scans. Stdout stays reserved for detections + the
@@ -29,7 +37,11 @@ const DEFAULT_EXCLUDES: &[&str] = &[];
 pub struct Match {
     pub path: PathBuf,
     pub sha256: String,
+    /// Signature-name label from the hash database, if this file's hash was
+    /// a known-bad match. Empty when the file was only flagged by YARA.
     pub label: String,
+    /// Identifiers of every YARA rule that matched this file's contents.
+    pub yara_rules: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -76,9 +88,16 @@ fn is_excluded(path: &Path, scan_root: &Path, extra_excludes: &[PathBuf]) -> boo
 ///
 /// `on_file` is called (from worker threads, possibly concurrently) for
 /// every file as it's visited, before hashing, so callers can print progress.
+///
+/// `yara_rules`, when given, is additionally matched against every file's
+/// contents so family/pattern-based detections surface alongside exact hash
+/// matches. A fresh [`yara_x::Scanner`] is created per rayon worker (via
+/// `for_each_init`) rather than per file, since `Scanner` isn't `Sync` but is
+/// cheap to reuse across many scans on the same thread.
 pub fn scan_path(
     root: &Path,
     db: &SignatureDb,
+    yara_rules: Option<&Rules>,
     extra_excludes: &[PathBuf],
     on_file: impl Fn(&Path) + Sync,
 ) -> Result<ScanReport> {
@@ -96,42 +115,71 @@ pub fn scan_path(
         .into_iter()
         .filter_entry(|e| !is_excluded(e.path(), root, extra_excludes))
         .par_bridge()
-        .for_each(|entry| {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => {
-                    files_errored.fetch_add(1, Ordering::Relaxed);
+        .for_each_init(
+            || {
+                let mut scanner = yara_rules.map(yara_x::Scanner::new);
+                if let Some(s) = scanner.as_mut() {
+                    s.max_scan_size(YARA_MAX_SCAN_SIZE);
+                }
+                scanner
+            },
+            |scanner, entry| {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => {
+                        files_errored.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
+                if !entry.file_type().is_file() {
                     return;
                 }
-            };
-            if !entry.file_type().is_file() {
-                return;
-            }
-            let path = entry.path();
-            on_file(path);
+                let path = entry.path();
+                on_file(path);
 
-            match hash_file(path) {
-                Ok(hash) => {
-                    let n = files_scanned.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n % PROGRESS_INTERVAL == 0 {
-                        eprintln!(
-                            "  ... {n} files scanned so far ({:.0}s elapsed)",
-                            start.elapsed().as_secs_f64()
-                        );
+                let hash = match hash_file(path) {
+                    Ok(hash) => hash,
+                    Err(_) => {
+                        files_errored.fetch_add(1, Ordering::Relaxed);
+                        return;
                     }
-                    if let Some(label) = db.lookup(&hash) {
-                        matches.lock().unwrap().push(Match {
-                            path: path.to_path_buf(),
-                            sha256: hash,
-                            label: label.to_string(),
-                        });
-                    }
+                };
+                let n = files_scanned.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % PROGRESS_INTERVAL == 0 {
+                    eprintln!(
+                        "  ... {n} files scanned so far ({:.0}s elapsed)",
+                        start.elapsed().as_secs_f64()
+                    );
                 }
-                Err(_) => {
-                    files_errored.fetch_add(1, Ordering::Relaxed);
+
+                let label = db.lookup(&hash).unwrap_or("");
+                let yara_hits: Vec<String> = match scanner {
+                    Some(scanner) => match scanner.scan_file(path) {
+                        Ok(results) => results
+                            .matching_rules()
+                            .map(|r| {
+                                if r.namespace() == "default" {
+                                    r.identifier().to_string()
+                                } else {
+                                    format!("{}::{}", r.namespace(), r.identifier())
+                                }
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+
+                if !label.is_empty() || !yara_hits.is_empty() {
+                    matches.lock().unwrap().push(Match {
+                        path: path.to_path_buf(),
+                        sha256: hash,
+                        label: label.to_string(),
+                        yara_rules: yara_hits,
+                    });
                 }
-            }
-        });
+            },
+        );
 
     Ok(ScanReport {
         files_scanned: files_scanned.load(Ordering::Relaxed),
@@ -164,7 +212,7 @@ mod tests {
         fs::write(&cache_path, format!("{evil_hash}\tTest.Signature\n")).unwrap();
         let db = SignatureDb::load(&cache_path).unwrap();
 
-        let report = scan_path(&dir, &db, &[], |_| {}).unwrap();
+        let report = scan_path(&dir, &db, None, &[], |_| {}).unwrap();
 
         // clean.txt + evil.bin (db.cache isn't a match but is still hashed)
         assert_eq!(report.files_scanned, 3);
@@ -180,7 +228,7 @@ mod tests {
         let dir = test_dir("missing");
         fs::remove_dir_all(&dir).ok();
         let db = SignatureDb::empty();
-        let err = scan_path(&dir, &db, &[], |_| {}).unwrap_err();
+        let err = scan_path(&dir, &db, None, &[], |_| {}).unwrap_err();
         assert!(err.to_string().contains("does not exist"));
     }
 
@@ -191,8 +239,30 @@ mod tests {
         fs::write(dir.join("subdir").join("skip.txt"), b"skip me").unwrap();
 
         let db = SignatureDb::empty();
-        let report = scan_path(&dir, &db, &[dir.join("subdir")], |_| {}).unwrap();
+        let report = scan_path(&dir, &db, None, &[dir.join("subdir")], |_| {}).unwrap();
         assert_eq!(report.files_scanned, 1);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn yara_match_surfaces_without_a_hash_hit() {
+        let dir = test_dir("yara");
+        fs::write(
+            dir.join("dropper.ps1"),
+            b"powershell -windowstyle hidden -EncodedCommand aGVsbG8=",
+        )
+        .unwrap();
+
+        let db = SignatureDb::empty();
+        let rule_set = crate::yara_rules::compile(&[]).unwrap();
+        let report = scan_path(&dir, &db, Some(&rule_set.rules), &[], |_| {}).unwrap();
+
+        assert_eq!(report.matches.len(), 1);
+        assert!(report.matches[0].label.is_empty());
+        assert!(report.matches[0]
+            .yara_rules
+            .contains(&"Qilin_Suspicious_PowerShell_EncodedCommand".to_string()));
 
         fs::remove_dir_all(&dir).ok();
     }

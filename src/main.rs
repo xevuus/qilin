@@ -1,5 +1,6 @@
 mod db;
 mod scan;
+mod yara_rules;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -7,7 +8,7 @@ use db::{Dataset, ExportFormat, SignatureDb};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "qilin", version, about = "A minimal file-hash malware scanner")]
+#[command(name = "qilin", version, about = "A file-hash and YARA malware scanner")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -29,6 +30,13 @@ enum Command {
         /// default /proc, /sys, /dev, /run exclusions on Unix.
         #[arg(long)]
         exclude: Vec<PathBuf>,
+        /// Directory of additional YARA rules (.yar/.yara) to load alongside
+        /// the bundled ones (repeatable).
+        #[arg(long)]
+        rules: Vec<PathBuf>,
+        /// Skip YARA pattern/family matching and only check file hashes.
+        #[arg(long)]
+        no_yara: bool,
     },
     /// Download and cache the MalwareBazaar hash export
     Update {
@@ -55,7 +63,9 @@ enum FormatArg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan { path, db, verbose, exclude } => cmd_scan(path, db, verbose, exclude),
+        Command::Scan { path, db, verbose, exclude, rules, no_yara } => {
+            cmd_scan(path, db, verbose, exclude, rules, no_yara)
+        }
         Command::Update { auth_key, db, full, format } => cmd_update(auth_key, db, full, format),
     }
 }
@@ -96,7 +106,14 @@ fn cmd_update(auth_key: String, db: Option<PathBuf>, full: bool, format: FormatA
     Ok(())
 }
 
-fn cmd_scan(path: Option<PathBuf>, db: Option<PathBuf>, verbose: bool, exclude: Vec<PathBuf>) -> Result<()> {
+fn cmd_scan(
+    path: Option<PathBuf>,
+    db: Option<PathBuf>,
+    verbose: bool,
+    exclude: Vec<PathBuf>,
+    rules: Vec<PathBuf>,
+    no_yara: bool,
+) -> Result<()> {
     let db_path = resolve_db_path(db)?;
     if !db_path.exists() {
         bail!(
@@ -105,6 +122,15 @@ fn cmd_scan(path: Option<PathBuf>, db: Option<PathBuf>, verbose: bool, exclude: 
         );
     }
     let signatures = SignatureDb::load(&db_path)?;
+
+    let rule_set = if no_yara {
+        None
+    } else {
+        Some(yara_rules::compile(&rules)?)
+    };
+    if let Some(rule_set) = &rule_set {
+        println!("Loaded {} YARA rule(s)", rule_set.rule_count);
+    }
 
     let path = match path {
         Some(p) => p,
@@ -131,19 +157,34 @@ fn cmd_scan(path: Option<PathBuf>, db: Option<PathBuf>, verbose: bool, exclude: 
         std::io::stdout().flush().ok();
     }
 
-    let report = scan::scan_path(&path, &signatures, &exclude, |p| {
-        if verbose {
-            println!("  scanning {}", p.display());
-        }
-    })?;
+    let report = scan::scan_path(
+        &path,
+        &signatures,
+        rule_set.as_ref().map(|r| &r.rules),
+        &exclude,
+        |p| {
+            if verbose {
+                println!("  scanning {}", p.display());
+            }
+        },
+    )?;
 
     for m in &report.matches {
-        let label = if m.label.is_empty() { "unknown" } else { &m.label };
+        let mut tags = Vec::new();
+        if !m.label.is_empty() {
+            tags.push(format!("hash={}", m.label));
+        }
+        for rule in &m.yara_rules {
+            tags.push(format!("yara={rule}"));
+        }
+        if tags.is_empty() {
+            tags.push("signature=unknown".to_string());
+        }
         println!(
-            "[INFECTED] {}  sha256={}  signature={}",
+            "[INFECTED] {}  sha256={}  {}",
             m.path.display(),
             m.sha256,
-            label
+            tags.join("  ")
         );
     }
 
