@@ -6,7 +6,7 @@ rule Qilin_Linux_Reverse_Shell_OneLiner
 
     strings:
         $bash_devtcp = /bash\s+-[ci]{1,2}\s+>&\s*\/dev\/tcp\/[^\s]+\/\d+\s*0(&1)?/ ascii
-        $nc_e = /nc(\.traditional)?\s+(-[a-zA-Z]*e[a-zA-Z]*\s+\S+|[^\n]*-e\s+\/bin\/(ba)?sh)/ ascii
+        $nc_e = /\bnc(\.traditional)?\b[^\n]{0,40}-e\s+\/bin\/(ba)?sh\b/ nocase ascii
         $mkfifo_nc = "mkfifo /tmp/" ascii
         $python_socket = /socket\.socket\([^\)]*\).{0,80}dup2/ ascii
         $perl_socket = "socket(S,PF_INET,SOCK_STREAM" ascii
