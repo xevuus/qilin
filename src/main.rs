@@ -1,10 +1,12 @@
 mod db;
+mod heuristics;
 mod scan;
 mod yara_rules;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use db::{Dataset, ExportFormat, SignatureDb};
+use scan::ScanOptions;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -37,6 +39,19 @@ enum Command {
         /// Skip YARA pattern/family matching and only check file hashes.
         #[arg(long)]
         no_yara: bool,
+        /// Skip entropy and PE-structure heuristics.
+        #[arg(long)]
+        no_heuristics: bool,
+        /// Bits-per-byte (0.0-8.0) above which a file is flagged as likely
+        /// packed/encrypted.
+        #[arg(long, default_value_t = heuristics::DEFAULT_ENTROPY_THRESHOLD)]
+        entropy_threshold: f64,
+        /// Move every detected file into this directory (deduplicated by
+        /// hash) and log the move, instead of only reporting it. Original
+        /// files are never deleted, only moved, so a quarantine action can
+        /// always be undone.
+        #[arg(long)]
+        quarantine: Option<PathBuf>,
     },
     /// Download and cache the MalwareBazaar hash export
     Update {
@@ -63,9 +78,27 @@ enum FormatArg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan { path, db, verbose, exclude, rules, no_yara } => {
-            cmd_scan(path, db, verbose, exclude, rules, no_yara)
-        }
+        Command::Scan {
+            path,
+            db,
+            verbose,
+            exclude,
+            rules,
+            no_yara,
+            no_heuristics,
+            entropy_threshold,
+            quarantine,
+        } => cmd_scan(
+            path,
+            db,
+            verbose,
+            exclude,
+            rules,
+            no_yara,
+            no_heuristics,
+            entropy_threshold,
+            quarantine,
+        ),
         Command::Update { auth_key, db, full, format } => cmd_update(auth_key, db, full, format),
     }
 }
@@ -113,7 +146,14 @@ fn cmd_scan(
     exclude: Vec<PathBuf>,
     rules: Vec<PathBuf>,
     no_yara: bool,
+    no_heuristics: bool,
+    entropy_threshold: f64,
+    quarantine: Option<PathBuf>,
 ) -> Result<()> {
+    if !(0.0..=8.0).contains(&entropy_threshold) {
+        bail!("--entropy-threshold must be between 0.0 and 8.0 (bits per byte), got {entropy_threshold}");
+    }
+
     let db_path = resolve_db_path(db)?;
     if !db_path.exists() {
         bail!(
@@ -130,6 +170,12 @@ fn cmd_scan(
     };
     if let Some(rule_set) = &rule_set {
         println!("Loaded {} YARA rule(s)", rule_set.rule_count);
+    }
+    if !no_heuristics {
+        println!("Heuristics enabled (entropy threshold {entropy_threshold:.1} bits/byte)");
+    }
+    if let Some(dir) = &quarantine {
+        println!("Quarantine enabled: detections will be moved to {}", dir.display());
     }
 
     let path = match path {
@@ -157,17 +203,18 @@ fn cmd_scan(
         std::io::stdout().flush().ok();
     }
 
-    let report = scan::scan_path(
-        &path,
-        &signatures,
-        rule_set.as_ref().map(|r| &r.rules),
-        &exclude,
-        |p| {
-            if verbose {
-                println!("  scanning {}", p.display());
-            }
-        },
-    )?;
+    let opts = ScanOptions {
+        yara_rules: rule_set.as_ref().map(|r| &r.rules),
+        extra_excludes: &exclude,
+        heuristics_enabled: !no_heuristics,
+        entropy_threshold,
+        quarantine_dir: quarantine.as_deref(),
+    };
+    let report = scan::scan_path(&path, &signatures, &opts, |p| {
+        if verbose {
+            println!("  scanning {}", p.display());
+        }
+    })?;
 
     for m in &report.matches {
         let mut tags = Vec::new();
@@ -177,14 +224,23 @@ fn cmd_scan(
         for rule in &m.yara_rules {
             tags.push(format!("yara={rule}"));
         }
+        for h in &m.heuristics {
+            tags.push(format!("heuristic={h}"));
+        }
         if tags.is_empty() {
             tags.push("signature=unknown".to_string());
         }
+        let quarantine_note = m
+            .quarantined_to
+            .as_ref()
+            .map(|p| format!("  quarantined_to={}", p.display()))
+            .unwrap_or_default();
         println!(
-            "[INFECTED] {}  sha256={}  {}",
+            "[INFECTED] {}  sha256={}  {}{}",
             m.path.display(),
             m.sha256,
-            tags.join("  ")
+            tags.join("  "),
+            quarantine_note
         );
     }
 
